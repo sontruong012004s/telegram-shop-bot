@@ -8,34 +8,52 @@ const { Markup } = require('telegraf');
 const { formatPrice } = require('../utils/keyboard');
 
 module.exports = (bot) => {
-    // Handle quantity selection: qty_{productId}_{quantity}
-    bot.action(/^qty_(\d+)_(\d+)$/, async (ctx) => {
-        const productId = parseInt(ctx.match[1]);
-        const quantity = parseInt(ctx.match[2]);
-        const product = productService.getById(productId);
-
-        if (!product) {
-            return ctx.answerCbQuery('❌ Sản phẩm không tồn tại');
+    // ════════════════════════════════════
+    // Lắng nghe sự kiện người dùng nhập số lượng vào ô input (Force Reply)
+    // ════════════════════════════════════
+    bot.on('text', async (ctx) => {
+        // Kiểm tra ngữ cảnh tin nhắn có phải là reply cho câu lệnh chọn số lượng từ productSelect không
+        if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.text.includes('Hãy nhập số lượng muốn mua vào ô tin nhắn:')) {
+            return;
         }
 
-        // Check stock availability (display_stock includes sheet_stock fallback)
-        const availableStock = product.display_stock || product.stock_count;
-        if (availableStock < quantity) {
-            return ctx.answerCbQuery(`❌ Chỉ còn ${availableStock} sản phẩm`);
+        const buyCtx = ctx.session?.buyContext;
+        if (!buyCtx) {
+            return ctx.reply('⚠️ Phiên làm việc đã hết hạn. Vui lòng chọn lại sản phẩm trong menu.');
         }
 
+        const quantity = parseInt(ctx.message.text);
+
+        // Kiểm tra tính hợp lệ của số lượng
+        if (isNaN(quantity) || quantity <= 0) {
+            return ctx.reply('⚠️ Số lượng không hợp lệ. Vui lòng nhập số nguyên lớn hơn 0.');
+        }
+
+        // Kiểm tra điều kiện mua tối thiểu (nếu số dư > 0đ mua min 1, nếu = 0đ mua min 10)
+        if (quantity < buyCtx.minQuantity) {
+            return ctx.reply(`⚠️ Số dư hiện tại của bạn là <b>${formatPrice(buyCtx.balance)}</b>, hệ thống yêu cầu mua tối thiểu từ <b>${buyCtx.minQuantity}</b> sản phẩm trở lên.`, { parse_mode: 'HTML' });
+        }
+
+        // Kiểm tra giới hạn tồn kho tối đa
+        if (quantity > buyCtx.availableStock) {
+            return ctx.reply(`⚠️ Không đủ hàng. Hiện chỉ còn ${buyCtx.availableStock} sản phẩm.`);
+        }
+
+        // Xóa context tạm sau khi đã lấy được số lượng hợp lệ
+        if (ctx.session) delete ctx.session.buyContext;
+
+        const product = productService.getById(buyCtx.productId);
         const banks = paymentService.getBanks();
 
         if (banks.length > 1) {
-            // Multiple banks → show bank selection
-            ctx.answerCbQuery();
+            // Nhiều ngân hàng -> Hiển thị chọn ngân hàng
             const totalPrice = product.price * quantity;
             const bankButtons = banks.map((b, i) =>
-                [Markup.button.callback(`🏦 ${b.NAME}`, `bank_${productId}_${quantity}_${i}`)]
+                [Markup.button.callback(`🏦 ${b.NAME}`, `bank_${product.id}_${quantity}_${i}`)]
             );
             bankButtons.push([Markup.button.callback('❌ Hủy', 'cancel_order')]);
 
-            ctx.replyWithHTML(
+            await ctx.replyWithHTML(
                 `📦 <b>${product.name}</b>\n` +
                 `📊 Số lượng: ${quantity}\n` +
                 `💵 Tổng tiền: <b>${formatPrice(totalPrice)}</b>\n\n` +
@@ -43,13 +61,15 @@ module.exports = (bot) => {
                 Markup.inlineKeyboard(bankButtons)
             );
         } else {
-            // Single bank → create order directly
-            ctx.answerCbQuery('⏳ Đang tạo đơn hàng...');
+            // 1 ngân hàng -> Tạo đơn trực tiếp
+            await ctx.reply('⏳ Đang tạo đơn hàng...');
             await createOrderAndPay(ctx, bot, product, quantity, 0);
         }
     });
 
-    // Handle bank selection: bank_{productId}_{quantity}_{bankIndex}
+    // ════════════════════════════════════
+    // Xử lý chọn ngân hàng: bank_{productId}_{quantity}_{bankIndex}
+    // ════════════════════════════════════
     bot.action(/^bank_(\d+)_(\d+)_(\d+)$/, async (ctx) => {
         const productId = parseInt(ctx.match[1]);
         const quantity = parseInt(ctx.match[2]);
@@ -65,7 +85,7 @@ module.exports = (bot) => {
             return ctx.answerCbQuery(`❌ Chỉ còn ${availableStock} sản phẩm`);
         }
 
-        ctx.answerCbQuery('⏳ Đang tạo đơn hàng...');
+        await ctx.answerCbQuery('⏳ Đang tạo đơn hàng...');
         await createOrderAndPay(ctx, bot, product, quantity, bankIndex);
     });
 
@@ -163,12 +183,12 @@ module.exports = (bot) => {
             const result = await deliverOrder(bot, orderId);
 
             if (result.success) {
-                ctx.editMessageText(
+                await ctx.editMessageText(
                     ctx.callbackQuery.message.text + '\n\n✅ ĐÃ XÁC NHẬN & GIAO HÀNG TỰ ĐỘNG!',
                     { parse_mode: 'HTML' }
                 );
             } else {
-                ctx.reply(`❌ Lỗi đơn #${orderId}: ${result.error}`);
+                await ctx.reply(`❌ Lỗi đơn #${orderId}: ${result.error}`);
             }
         } else {
             // ── MANUAL DELIVERY: No stock entries → ask admin to provide account info ──
@@ -185,12 +205,12 @@ module.exports = (bot) => {
                 quantity: order.quantity,
             });
 
-            ctx.editMessageText(
+            await ctx.editMessageText(
                 ctx.callbackQuery.message.text + '\n\n💳 ĐÃ XÁC NHẬN THANH TOÁN',
                 { parse_mode: 'HTML' }
             );
 
-            ctx.replyWithHTML(
+            await ctx.replyWithHTML(
                 `📝 <b>GIAO HÀNG THỦ CÔNG — Đơn #${orderId}</b>\n\n` +
                 `📦 SP: <b>${product.name}</b>\n` +
                 `📊 SL: ${order.quantity}\n\n` +
@@ -209,7 +229,7 @@ module.exports = (bot) => {
         const orderId = parseInt(ctx.match[1]);
         orderService.cancel(orderId);
         ctx.answerCbQuery('❌ Đã hủy');
-        ctx.editMessageText(
+        await ctx.editMessageText(
             ctx.callbackQuery.message.text + '\n\n❌ ĐÃ HỦY ĐƠN HÀNG',
             { parse_mode: 'HTML' }
         );
@@ -217,7 +237,7 @@ module.exports = (bot) => {
         // Notify customer
         const order = orderService.getById(orderId);
         if (order) {
-            bot.telegram.sendMessage(order.user_id, '❌ Đơn hàng của bạn đã bị hủy. Liên hệ hỗ trợ nếu cần.').catch(() => { });
+            await bot.telegram.sendMessage(order.user_id, '❌ Đơn hàng của bạn đã bị hủy. Liên hệ hỗ trợ nếu cần.').catch(() => { });
         }
     });
 
