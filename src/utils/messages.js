@@ -1,121 +1,304 @@
+const productService = require('../services/productService');
+const orderService = require('../services/orderService');
+const paymentService = require('../services/paymentService');
+const userService = require('../services/userService');
+const messages = require('../utils/messages');
 const config = require('../config');
-const { formatPrice } = require('./keyboard');
+const { Markup } = require('telegraf');
+const { formatPrice } = require('../utils/keyboard');
 
-const SHOP = config.SHOP_NAME;
+// Bộ nhớ tạm lưu trữ trạng thái người dùng đang chuẩn bị mua sản phẩm gì
+const awaitingQuantity = new Map();
 
-const messages = {
-    welcome: (name) =>
-        `👋 Chào mừng <b>${name}</b> đến với <b>${SHOP}</b>!\n\n` +
-        `🛒 Chuyên cung cấp tài khoản Premium giá rẻ\n\n` +
-        `📋 <b>Danh sách lệnh:</b>\n` +
-        `/start — 🔄 Bắt đầu / Khởi động lại\n` +
-        `/menu — 👤 Thông tin tài khoản\n` +
-        `/product — 📦 Danh sách sản phẩm\n` +
-        `/nap — 💰 Nạp số dư\n` +
-        `/checkpay — 🔍 Kiểm tra thanh toán\n` +
-        `/support — 🆘 Hỗ trợ\n` +
-        `/myid — 🆔 Lấy ID của bạn`,
+module.exports = (bot) => {
+    // 1. Kích hoạt nhập số lượng bằng ô input (Force Reply) khi bấm nút mua sản phẩm
+    // Pattern callback giả định từ nút mua: buy_{productId}
+    bot.action(/^buy_(\d+)$/, async (ctx) => {
+        const productId = parseInt(ctx.match[1]);
+        const product = productService.getById(productId);
 
-    accountInfo: (user) =>
-        `👤 <b>Thông tin tài khoản</b>\n\n` +
-        `🆔 ID: <code>${user.telegram_id}</code>\n` +
-        `👤 Tên: ${user.full_name}\n` +
-        `💰 Số dư: <b>${formatPrice(user.balance)}</b>\n` +
-        `📅 Tham gia: ${user.created_at}`,
+        if (!product) {
+            return ctx.answerCbQuery('❌ Sản phẩm không tồn tại');
+        }
 
-    productHeader:
-        '👇 👇 👇  Chọn sản phẩm bạn muốn mua bên dưới:',
+        const availableStock = product.display_stock || product.stock_count;
+        if (availableStock <= 0) {
+            return ctx.answerCbQuery('❌ Sản phẩm đã hết hàng');
+        }
 
-    selectQuantity: (product) =>
-        `📦 <b>${product.name}</b>\n` +
-        `💰 Giá: ${formatPrice(product.price)}/cái\n` +
-        `📊 Còn lại: ${product.display_stock || product.stock_count} sản phẩm\n\n` +
-        `Chọn số lượng muốn mua:`,
+        // Lấy thông tin user để kiểm tra số dư
+        const user = userService.findOrCreate(ctx.from);
+        const userBalance = user.balance || 0;
 
-    contactOnly: (product) =>
-        `📦 <b>${product.name}</b>\n\n` +
-        `💰 Giá: ${formatPrice(product.price)}\n` +
-        (product.promotion ? `📋 ${product.promotion}\n` : '') +
-        `Liên hệ mua ở phía dưới để mình nâng nha các tình yêu\n\n` +
-        `💬 Sản phẩm này cần liên hệ trực tiếp để mua.\n` +
-        `Bấm nút bên dưới để xem thông tin liên hệ.`,
+        // Xác định điều kiện mua tối thiểu
+        // Nếu số dư > 0đ, min là 1. Nếu tài khoản không có tiền (hoặc <= 0), min là 10.
+        const minQuantity = userBalance > 0 ? 1 : 10;
 
-    paymentQR: (order, product, paymentCode) =>
-        `⏳ <b>Đang chờ thanh toán ${formatPrice(order.total_price)}...</b>\n\n` +
-        `Quét mã QR phía trên để chuyển khoản.\n\n` +
-        `💰 <b>THANH TOÁN ĐƠN HÀNG</b>\n\n` +
-        `📦 Sản phẩm: ${product.name}\n` +
-        `📊 Số lượng: ${order.quantity}\n` +
-        `💵 Tổng tiền: <b>${formatPrice(order.total_price)}</b>\n\n` +
-        `━━━━━━━━━━━━━━━━━\n\n` +
-        `🏦 Quét mã QR để chuyển khoản\n` +
-        `├ Số tiền: <b>${formatPrice(order.total_price)}</b>\n` +
-        `└ Nội dung CK: <code>${paymentCode}</code>`,
-
-    orderSuccess: (product, quantity, accounts) => {
-        let msg =
-            `✅ <b>ĐƠN HÀNG THÀNH CÔNG!</b>\n\n` +
-            `📦 ${product.name} × ${quantity}\n\n` +
-            `🔑 <b>Thông tin tài khoản:</b>\n`;
-
-        accounts.forEach((acc, i) => {
-            msg += `${i + 1})\n<code>${acc}</code>\n`;
+        // Lưu tạm thông tin vào bộ nhớ
+        awaitingQuantity.set(ctx.from.id, {
+            productId: productId,
+            productName: product.name,
+            availableStock: availableStock,
+            price: product.price,
+            minQuantity: minQuantity,
+            userBalance: userBalance
         });
 
-        msg += `\n📖 <b>Hướng dẫn:</b> maill | passmail | passchatgpt\n` +
-            `log vào outlook.com để lấy code nha các bạn`;
+        await ctx.answerCbQuery();
+        
+        let noticeMsg = `📦 <b>${product.name}</b>\n` +
+                        `📊 Tồn kho: ${availableStock} sản phẩm\n` +
+                        `💰 Số dư tài khoản: <b>${formatPrice(userBalance)}</b>\n\n`;
 
-        return msg;
-    },
+        if (userBalance > 0) {
+            noticeMsg += `👉 <i>Số dư của bạn > 0đ, bạn có thể mua từ 1 cái trở lên.</i>\n`;
+        } else {
+            noticeMsg += `⚠️ <i>Số dư của bạn = 0đ, hệ thống yêu cầu mua tối thiểu từ <b>10 cái</b> trở lên.</i>\n`;
+        }
 
-    orderSuccessNotify: (quantity) =>
-        `✅ Đã mua thành công ${quantity} tài khoản! Kiểm tra tin nhắn bên dưới.`,
+        noticeMsg += `\n⌨️ <b>Vui lòng nhập số lượng muốn mua vào ô tin nhắn:</b>`;
 
-    noStock:
-        '❌ Rất tiếc, sản phẩm đã hết hàng. Vui lòng thử lại sau.',
+        await ctx.replyWithHTML(noticeMsg, {
+            reply_markup: {
+                force_reply: true
+            }
+        });
+    });
 
-    invalidQuantity: (available) =>
-        `❌ Không đủ hàng. Hiện chỉ còn ${available} sản phẩm.`,
+    // 2. Lắng nghe tin nhắn văn bản (text) phản hồi lại câu hỏi của bot
+    bot.on('text', async (ctx) => {
+        // Bỏ qua nếu không phải là tin nhắn trả lời (reply) đúng ngữ cảnh chọn số lượng
+        if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.text.includes('Vui lòng nhập số lượng muốn mua vào ô tin nhắn:')) {
+            return; 
+        }
 
-    napInfo: (amount, paymentCode) =>
-        `💰 <b>NẠP SỐ DƯ</b>\n\n` +
-        `Quét mã QR để nạp ${formatPrice(amount)} vào tài khoản.\n\n` +
-        `🏦 Quét mã QR để chuyển khoản\n` +
-        `├ Số tiền: <b>${formatPrice(amount)}</b>\n` +
-        `└ Nội dung CK: <code>${paymentCode}</code>`,
+        const userId = ctx.from.id;
+        const sessionData = awaitingQuantity.get(userId);
 
-    checkPayStatus: (order) => {
-        const statusMap = {
-            pending: '⏳ Đang chờ thanh toán',
-            paid: '💵 Đã thanh toán',
-            delivered: '✅ Đã giao hàng',
-            cancelled: '❌ Đã hủy',
-        };
-        return (
-            `🔍 <b>Trạng thái đơn hàng #${order.id}</b>\n\n` +
-            `📦 Sản phẩm: ${order.product_name}\n` +
-            `📊 Số lượng: ${order.quantity}\n` +
-            `💵 Tổng tiền: ${formatPrice(order.total_price)}\n` +
-            `📋 Trạng thái: ${statusMap[order.status] || order.status}\n` +
-            `📅 Ngày tạo: ${order.created_at}`
+        if (!sessionData) {
+            return ctx.reply('⚠️ Phiên giao dịch đã hết hạn. Vui lòng bấm chọn lại sản phẩm.');
+        }
+
+        const quantity = parseInt(ctx.message.text);
+
+        // Kiểm tra tính hợp lệ của số lượng nhập vào
+        if (isNaN(quantity) || quantity <= 0) {
+            return ctx.reply('⚠️ Số lượng không hợp lệ. Vui lòng nhập một số nguyên lớn hơn 0.');
+        }
+
+        // Kiểm tra điều kiện số lượng tối thiểu dựa trên số dư lúc bấm nút
+        if (quantity < sessionData.minQuantity) {
+            return ctx.reply(`⚠️ Bạn cần mua tối thiểu từ <b>${sessionData.minQuantity}</b> sản phẩm trở lên vì số dư hiện tại của bạn là <b>${formatPrice(sessionData.userBalance)}</b>.`, { parse_mode: 'HTML' });
+        }
+
+        // Kiểm tra giới hạn kho
+        if (quantity > sessionData.availableStock) {
+            return ctx.reply(`⚠️ Số lượng vượt quá tồn kho hiện tại (chỉ còn ${sessionData.availableStock} sản phẩm).`);
+        }
+
+        // Hoàn tất xử lý, xóa bộ nhớ tạm
+        awaitingQuantity.delete(userId);
+
+        const product = productService.getById(sessionData.productId);
+        const banks = paymentService.getBanks();
+
+        if (banks.length > 1) {
+            // Nhiều ngân hàng -> Hiển thị chọn ngân hàng
+            const totalPrice = product.price * quantity;
+            const bankButtons = banks.map((b, i) =>
+                [Markup.button.callback(`🏦 ${b.NAME}`, `bank_${product.id}_${quantity}_${i}`)]
+            );
+            bankButtons.push([Markup.button.callback('❌ Hủy', 'cancel_order')]);
+
+            await ctx.replyWithHTML(
+                `📦 <b>${product.name}</b>\n` +
+                `📊 Số lượng: ${quantity}\n` +
+                `💵 Tổng tiền: <b>${formatPrice(totalPrice)}</b>\n\n` +
+                `🏦 Chọn ngân hàng thanh toán:`,
+                Markup.inlineKeyboard(bankButtons)
+            );
+        } else {
+            // 1 ngân hàng -> Tạo đơn trực tiếp
+            await ctx.reply('⏳ Đang tạo đơn hàng...');
+            await createOrderAndPay(ctx, bot, product, quantity, 0);
+        }
+    });
+
+    // Xử lý chọn ngân hàng: bank_{productId}_{quantity}_{bankIndex}
+    bot.action(/^bank_(\d+)_(\d+)_(\d+)$/, async (ctx) => {
+        const productId = parseInt(ctx.match[1]);
+        const quantity = parseInt(ctx.match[2]);
+        const bankIndex = parseInt(ctx.match[3]);
+        const product = productService.getById(productId);
+
+        if (!product) {
+            return ctx.answerCbQuery('❌ Sản phẩm không tồn tại');
+        }
+
+        const availableStock = product.display_stock || product.stock_count;
+        if (availableStock < quantity) {
+            return ctx.answerCbQuery(`❌ Chỉ còn ${availableStock} sản phẩm`);
+        }
+
+        await ctx.answerCbQuery('⏳ Đang tạo đơn hàng...');
+        await createOrderAndPay(ctx, bot, product, quantity, bankIndex);
+    });
+
+    // ════════════════════════════════════
+    // Shared: Create order + send QR generation + Admin notification
+    // ════════════════════════════════════
+    async function createOrderAndPay(ctx, bot, product, quantity, bankIndex) {
+        userService.findOrCreate(ctx.from);
+
+        const totalPrice = product.price * quantity;
+        const payment = paymentService.generatePayment(totalPrice, bankIndex);
+
+        const order = orderService.create(
+            ctx.from.id,
+            product.id,
+            quantity,
+            totalPrice,
+            payment.paymentCode
         );
-    },
 
-    supportInfo:
-        `🆘 <b>HỖ TRỢ</b>\n\n` +
-        `Nếu bạn gặp vấn đề, liên hệ:\n` +
-        `👉 ${config.SUPPORT_CONTACT}\n\n` +
-        `⏰ Hỗ trợ 24/7`,
+        // 1. Gửi QR code cho khách hàng
+        const caption =
+            `⏳ <b>Đang chờ thanh toán ${formatPrice(totalPrice)}...</b>\n\n` +
+            `Quét mã QR phía trên để chuyển khoản.\n\n` +
+            `💰 <b>THANH TOÁN ĐƠN HÀNG</b>\n\n` +
+            `📦 Sản phẩm: ${product.name}\n` +
+            `📊 Số lượng: ${quantity}\n` +
+            `💵 Tổng tiền: <b>${formatPrice(totalPrice)}</b>\n\n` +
+            `━━━━━━━━━━━━━━━━━\n\n` +
+            `🏦 Quét mã QR để chuyển khoản\n` +
+            `├ Số tiền: <b>${formatPrice(totalPrice)}</b>\n` +
+            `└ Nội dung CK: <code>${payment.paymentCode}</code>\n\n` +
+            `⏰ QR hiệu lực trong <b>15 phút</b>\n` +
+            `🚫 <b>KHÔNG</b> thay đổi nội dung chuyển khoản\n` +
+            `✅ Sau khi CK thành công, hàng sẽ được\ngiao <b>tự động</b> trong vòng dưới 60 giây`;
 
-    myId: (id) =>
-        `🆔 <b>Telegram ID của bạn:</b>\n<code>${id}</code>`,
+        await ctx.replyWithPhoto(payment.qrUrl, {
+            caption,
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Hủy thanh toán', `cancel_order_${order.id}`)],
+            ]),
+        });
 
-    adminOnly: '⛔ Bạn không có quyền sử dụng lệnh này.',
+        // 2. Thông báo cho Admin
+        const userName = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+        const adminMsg =
+            `🔔 <b>ĐƠN HÀNG MỚI #${order.id}</b>\n\n` +
+            `👤 Khách: <b>${userName}</b> (<code>${ctx.from.id}</code>)\n` +
+            (ctx.from.username ? `📱 @${ctx.from.username}\n` : '') +
+            `\n` +
+            `📦 Sản phẩm: <b>${product.name}</b>\n` +
+            `📊 Số lượng: ${quantity}\n` +
+            `💰 Tổng tiền: <b>${formatPrice(totalPrice)}</b>\n` +
+            `🏦 Bank: <b>${payment.bankName}</b>\n` +
+            `🔑 Mã CK: <code>${payment.paymentCode}</code>\n\n` +
+            `━━━━━━━━━━━━━━━━━\n` +
+            `✅ Xác nhận & giao hàng:\n` +
+            `<code>/confirm ${order.id}</code>`;
 
-    orderCancelled: '❌ Đơn hàng đã bị hủy.',
+        try {
+            await bot.telegram.sendMessage(config.ADMIN_ID, adminMsg, {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback(`✅ Xác nhận #${order.id}`, `admin_confirm_${order.id}`),
+                        Markup.button.callback(`❌ Hủy #${order.id}`, `admin_cancel_${order.id}`),
+                    ],
+                ]),
+            });
+        } catch (err) {
+            console.error('Failed to notify admin:', err.message);
+        }
+    }
 
-    paymentPending:
-        '⏳ Chưa nhận được thanh toán. Vui lòng chờ hoặc liên hệ hỗ trợ.',
+    // Xử lý tác vụ nhanh của Admin trên thông báo đơn hàng
+    bot.action(/^admin_confirm_(\d+)$/, async (ctx) => {
+        if (ctx.from.id !== config.ADMIN_ID) return ctx.answerCbQuery('⛔');
+
+        const orderId = parseInt(ctx.match[1]);
+        const order = orderService.getById(orderId);
+        if (!order) return ctx.answerCbQuery('❌ Đơn hàng không tồn tại');
+        if (order.status !== 'pending') return ctx.answerCbQuery('⚠️ Đơn đã xử lý');
+
+        const product = productService.getById(order.product_id);
+        const realStock = productService.getAvailableStock(order.product_id, order.quantity);
+
+        if (realStock.length >= order.quantity) {
+            ctx.answerCbQuery('⏳ Đang xử lý...');
+            const { deliverOrder } = require('./paymentConfirm');
+            const result = await deliverOrder(bot, orderId);
+
+            if (result.success) {
+                await ctx.editMessageText(
+                    ctx.callbackQuery.message.text + '\n\n✅ ĐÃ XÁC NHẬN & GIAO HÀNG TỰ ĐỘNG!',
+                    { parse_mode: 'HTML' }
+                );
+            } else {
+                await ctx.reply(`❌ Lỗi đơn #${orderId}: ${result.error}`);
+            }
+        } else {
+            ctx.answerCbQuery('📝 Cần cung cấp tài khoản...');
+            orderService.markPaid(orderId);
+
+            const { setAdminState } = require('./adminActions');
+            setAdminState(ctx.from.id, {
+                action: 'deliver_order',
+                orderId: orderId,
+                userId: order.user_id,
+                productName: product.name,
+                quantity: order.quantity,
+            });
+
+            await ctx.editMessageText(
+                ctx.callbackQuery.message.text + '\n\n💳 ĐÃ XÁC NHẬN THANH TOÁN',
+                { parse_mode: 'HTML' }
+            );
+
+            await ctx.replyWithHTML(
+                `📝 <b>GIAO HÀNG THỦ CÔNG — Đơn #${orderId}</b>\n\n` +
+                `📦 SP: <b>${product.name}</b>\n` +
+                `📊 SL: ${order.quantity}\n\n` +
+                `👇 Gửi thông tin tài khoản ngay bây giờ:\n\n` +
+                `<i>Ví dụ:</i>\n` +
+                `<code>email@outlook.com|passmail|passchatgpt</code>\n\n` +
+                `Bot sẽ tự động chuyển cho khách.\n` +
+                `Gõ /cancel để hủy.`
+            );
+        }
+    });
+
+    bot.action(/^admin_cancel_(\d+)$/, (ctx) => {
+        if (ctx.from.id !== config.ADMIN_ID) return ctx.answerCbQuery('⛔');
+
+        const orderId = parseInt(ctx.match[1]);
+        orderService.cancel(orderId);
+        ctx.answerCbQuery('❌ Đã hủy');
+        ctx.editMessageText(
+            ctx.callbackQuery.message.text + '\n\n❌ ĐÃ HỦY ĐƠN HÀNG',
+            { parse_mode: 'HTML' }
+        );
+
+        const order = orderService.getById(orderId);
+        if (order) {
+            bot.telegram.sendMessage(order.user_id, '❌ Đơn hàng của bạn đã bị hủy. Liên hệ hỗ trợ nếu cần.').catch(() => { });
+        }
+    });
+
+    // Xử lý hủy đơn (phía người dùng)
+    bot.action('cancel_order', (ctx) => {
+        ctx.answerCbQuery('❌ Đã hủy');
+        ctx.editMessageText('❌ Đơn hàng đã bị hủy.');
+    });
+
+    bot.action(/^cancel_order_(\d+)$/, (ctx) => {
+        const orderId = parseInt(ctx.match[1]);
+        orderService.cancel(orderId);
+        ctx.answerCbQuery('❌ Đã hủy đơn hàng');
+        ctx.reply('❌ Đơn hàng đã bị hủy.');
+    });
 };
-
-module.exports = messages;
